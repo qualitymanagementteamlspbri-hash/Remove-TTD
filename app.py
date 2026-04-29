@@ -1,6 +1,6 @@
 """
 ================================================================================
-  SIGNATURE BG REMOVER — Streamlit v4.0
+  SIGNATURE BG REMOVER — Streamlit v4.2
   Fix: session_state stabil, PIL disimpan sebagai bytes, step machine benar
 ================================================================================
   pip install streamlit opencv-python-headless pillow numpy
@@ -184,37 +184,74 @@ def mk_white(img_bgr, thr, blur_k):
     return m
 
 def mk_dark(img_bgr, thr, blur_k):
-    """Logika TERBALIK: piksel gelap dihapus, tanda tangan terang dipertahankan."""
-    g = _gblur(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), blur_k)
-    _, m = cv2.threshold(g, thr, 255, cv2.THRESH_BINARY)
-    return m
+    """Mode aman untuk background hitam/gelap dengan tinta abu-abu, biru, hitam, atau warna lain."""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray_blur = _gblur(gray, blur_k) if blur_k > 1 else gray
+    bg = _sample_bg(img_bgr)
+    bg_gray = int(np.mean(bg))
+    diff = cv2.absdiff(gray_blur, np.full_like(gray_blur, bg_gray))
+    diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+    safe_thr = int(max(6, min(thr, 28)))
+    _, m_diff = cv2.threshold(diff, safe_thr, 255, cv2.THRESH_BINARY)
+    edges = cv2.Canny(gray_blur, 12, 70)
+    edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
+    light_part = cv2.inRange(gray, min(bg_gray + 5, 255), 255)
+    mask = cv2.bitwise_or(m_diff, edges)
+    mask = cv2.bitwise_or(mask, light_part)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    return mask
+
+def mk_paper_photo_signature(img_bgr, blur_k=3):
+    """Untuk tanda tangan pada foto kertas nyata: bayangan, lipatan, garis tepi, dan pencahayaan tidak rata."""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = _gblur(gray, blur_k) if blur_k > 1 else gray
+    bg = cv2.medianBlur(gray, 31)
+    norm = cv2.divide(gray, bg, scale=255)
+    mask = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 35, 9)
+    edges = cv2.Canny(norm, 25, 100)
+    edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
+    mask = cv2.bitwise_or(mask, edges)
+    h, w = mask.shape
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(40, w // 4), 1))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(40, h // 4)))
+    h_lines = cv2.morphologyEx(mask, cv2.MORPH_OPEN, horizontal_kernel)
+    v_lines = cv2.morphologyEx(mask, cv2.MORPH_OPEN, vertical_kernel)
+    lines = cv2.bitwise_or(h_lines, v_lines)
+    lines = cv2.dilate(lines, np.ones((3, 3), np.uint8), iterations=1)
+    mask[lines > 0] = 0
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    clean = np.zeros_like(mask)
+    min_area = max(4, int(mask.size * 0.00001))
+    max_area = int(mask.size * 0.20)
+    for i in range(1, num):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if min_area <= area <= max_area:
+            clean[labels == i] = 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, k)
+    return clean
 
 def mk_color(img_bgr, tol, blur_k):
     bg = _sample_bg(img_bgr)
     return _color_mask(img_bgr, bg, tol, blur_k)
 
 def mk_complex(img_bgr, tol, thr, blur_k):
-    gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    blur  = _gblur(gray, max(blur_k, 3))
-    adapt = cv2.adaptiveThreshold(blur, 255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 8)
-    _, gm = cv2.threshold(blur, thr, 255, cv2.THRESH_BINARY_INV)
-    bg    = _sample_bg(img_bgr)
-    cm    = _color_mask(img_bgr, bg, tol, blur_k)
-    comb  = cv2.bitwise_and(adapt, cm)
-    extra = cv2.bitwise_and(gm, cv2.bitwise_not(
-                np.where(cm==0,255,0).astype(np.uint8)))
-    comb  = cv2.bitwise_or(comb, extra)
-    comb  = _del_lines(img_bgr, comb)
-    ko    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
-    return cv2.morphologyEx(comb, cv2.MORPH_OPEN, ko)
+    # Mode legacy, tetap disediakan untuk kompatibilitas.
+    return mk_paper_photo_signature(img_bgr, max(blur_k, 3))
 
 def auto_detect(img_bgr) -> str:
     bg  = _sample_bg(img_bgr)
     avg = float(np.mean(bg))
-    if avg < 55:            return "dark"
-    if np.all(bg > 205):    return "white"
-    if _has_lines(img_bgr): return "complex"
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    std_gray = float(np.std(gray))
+    if avg < 70:
+        return "dark"
+    if _has_lines(img_bgr) or std_gray > 45:
+        return "complex"
+    if np.all(bg > 200):
+        return "white"
     return "color"
 
 def is_transparent(raw: bytes) -> bool:
@@ -222,6 +259,25 @@ def is_transparent(raw: bytes) -> bool:
     img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
     if img is None or img.ndim < 3 or img.shape[2] != 4: return False
     return float(np.sum(img[:,:,3] < 128)) / img[:,:,3].size > 0.08
+
+
+def validate_mask(mask: np.ndarray, min_ratio: float = 0.0003, max_ratio: float = 0.45) -> tuple[bool, str]:
+    """
+    Safety check agar hasil remove BG tidak menyimpan file yang tanda tangannya hilang.
+    - Terlalu sedikit foreground: kemungkinan tanda tangan ikut terhapus.
+    - Terlalu banyak foreground: kemungkinan background masih ikut terbawa.
+    """
+    if mask is None or mask.size == 0:
+        return False, "Mask kosong / tidak valid"
+
+    fg_ratio = float(np.sum(mask > 0)) / float(mask.size)
+
+    if fg_ratio < min_ratio:
+        return False, f"Foreground terlalu sedikit ({fg_ratio:.4%}); kemungkinan tanda tangan hilang"
+    if fg_ratio > max_ratio:
+        return False, f"Foreground terlalu banyak ({fg_ratio:.2%}); kemungkinan background masih terbawa"
+
+    return True, "OK"
 
 # ── Helper PIL ────────────────────────────────────────────────────────────────
 
@@ -258,8 +314,11 @@ def process_one(raw: bytes, mode: str, w_thr: int, d_thr: int,
       message   : pesan error/skip
     """
     if skip_transp and is_transparent(raw):
-        return {"status":"skipped","mode":"skip",
-                "message":"PNG sudah transparan, dilewati"}
+        # PNG yang sudah transparan TIDAK diproses ulang,
+        # tetapi tetap dimasukkan sebagai hasil final agar ikut masuk Review dan ZIP Download.
+        return {"status":"ok","mode":"skip_png",
+                "png_bytes":raw,
+                "message":"PNG sudah transparan, tidak diproses ulang tetapi tetap disertakan"}
 
     arr = np.frombuffer(raw, np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -272,14 +331,19 @@ def process_one(raw: bytes, mode: str, w_thr: int, d_thr: int,
         det = auto_detect(bgr) if mode == "auto" else mode
 
         if   det == "white":   mask = mk_white(bgr, w_thr, blur_k);  tight = False
-        elif det == "dark":    mask = mk_dark(bgr, d_thr, blur_k);   tight = True
+        elif det == "dark":    mask = mk_dark(bgr, d_thr, blur_k);   tight = False
         elif det == "color":   mask = mk_color(bgr, tol, blur_k);    tight = False
-        elif det == "complex": mask = mk_complex(bgr, tol, w_thr, blur_k); tight = False
+        elif det == "complex": mask = mk_paper_photo_signature(bgr, max(blur_k, 3)); tight = False
         else:
             return {"status":"error","mode":mode,
                     "message":f"Mode tidak dikenal: {mode}"}
 
         mask = _morph(mask, tight)
+
+        valid, msg = validate_mask(mask)
+        if not valid:
+            return {"status":"error","mode":det,"message":msg}
+
         rgba = np.dstack([rgb, mask])
         if min_a > 0:
             rgba = _trim_alpha(rgba, min_a)
@@ -300,7 +364,7 @@ with st.sidebar:
       <div style='font-size:2rem'>✍️</div>
       <div style='font-weight:700;font-size:.9rem;color:#e2e8f0;margin-top:3px'>BG Remover</div>
       <div style='font-size:.62rem;color:#4b5563;text-transform:uppercase;
-           letter-spacing:1px;font-weight:600'>v4.0</div>
+           letter-spacing:1px;font-weight:600'>v4.2</div>
     </div>
     <hr style='border-color:rgba(255,255,255,.05);margin:10px 0'>
     """, unsafe_allow_html=True)
@@ -327,7 +391,7 @@ with st.sidebar:
     ca, cb = st.columns(2)
     W_THR = ca.number_input("Threshold Putih", 100, 250, 200, 5,
         help="Naik → hapus lebih agresif (bg putih). Turun → lebih aman.")
-    D_THR = cb.number_input("Threshold Gelap", 20, 150, 55, 5,
+    D_THR = cb.number_input("Threshold Gelap", 5, 80, 18, 1,
         help="Untuk bg hitam. Turun → TTD tipis/biru aman. Naik → lebih bersih.")
 
     TOLERANCE = st.slider("Toleransi Warna", 10, 80, 38, 2,
@@ -376,9 +440,11 @@ TAB_SINGLE, TAB_BATCH, TAB_GUIDE = st.tabs([
 ])
 
 # ─── Lookup tables (digunakan di beberapa tempat) ────────────────────────────
-_MCSS = {"white":"mw","dark":"md","color":"mc","complex":"mx","skip":"ms","?":"ms"}
+_MCSS = {"white":"mw","dark":"md","color":"mc","complex":"mx",
+         "skip":"ms","skip_png":"ms","?":"ms"}
 _MLBL = {"white":"Putih","dark":"Bg Hitam","color":"Berwarna",
-         "complex":"Kompleks","skip":"Skip","?":"Error"}
+         "complex":"Kompleks","skip":"Skip","skip_png":"PNG Transparan",
+         "?":"Error"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -432,8 +498,8 @@ with TAB_SINGLE:
 
         if transp and SKIP_TRANSP:
             st.markdown("""<div class='info iy'>
-            ⚡ File ini sudah transparan → akan di-skip di batch.
-            Matikan "Skip PNG Transparan" di sidebar untuk tetap diproses.
+            ⚡ File ini sudah transparan → tidak diproses ulang, tetapi tetap ikut masuk Review dan ZIP Download.
+            Matikan "Skip PNG Transparan" di sidebar jika ingin memproses ulang file ini.
             </div>""", unsafe_allow_html=True)
 
         if st.button("🚀 Proses Sekarang", type="primary", use_container_width=True):
@@ -803,7 +869,7 @@ with TAB_BATCH:
                             key=f"rpm_{fname}")
                         rp_wt = st.slider("Threshold Putih",100,250,W_THR,5,
                                           key=f"rpt_{fname}")
-                        rp_dt = st.slider("Threshold Gelap",20,150,D_THR,5,
+                        rp_dt = st.slider("Threshold Gelap",5,80,D_THR,1,
                                           key=f"rpd_{fname}")
                         rp_tl = st.slider("Toleransi",10,80,int(TOLERANCE),2,
                                           key=f"rpc_{fname}")
@@ -922,7 +988,7 @@ with TAB_GUIDE:
 | **Background Hitam** (tinta biru/putih/warna) | `dark` | Logika TERBALIK — piksel gelap dihapus |
 | **Kertas Putih / HVS** | `white` | Threshold kecerahan |
 | **Kertas Berwarna / Bergaris / Watermark** | `complex` | Adaptive + LAB color + hapus garis |
-| **PNG sudah transparan** | `skip` | Dilewati otomatis |
+| **PNG sudah transparan** | `skip_png` | Tidak diproses ulang, tetap ikut hasil download |
 
 ---
 
@@ -949,8 +1015,8 @@ with TAB_GUIDE:
 ---
 
 ### ⚡ Skip PNG Transparan
-PNG dengan ≥8% piksel sudah transparan → dilewati otomatis.  
-Ini mencegah TTD yang sudah bersih malah rusak saat parameter dinaikkan.
+PNG dengan ≥8% piksel transparan → tidak diproses ulang, tetapi tetap dimasukkan ke hasil final.  
+Ini mencegah TTD yang sudah bersih rusak saat parameter dinaikkan, sekaligus memastikan file tetap ikut ZIP Download.
 
 ---
 
